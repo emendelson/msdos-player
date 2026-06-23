@@ -1130,6 +1130,7 @@ bool is_dbcs_cp = false;
 bool hide_cursor = false;
 
 char devices_to_load[MAX_PATH]= {0};
+char print_dir[MAX_PATH] = {0};	// -o printer output folder (empty = temp)
 
 #define UPDATE_OPS 16384
 #define REQUEST_HARDWRE_UPDATE() { \
@@ -4573,6 +4574,7 @@ int main(int argc, char *argv[], char *envp[])
 			ansi_sys = ((buffer[1] & 0x04) != 0);
 			box_line = ((buffer[1] & 0x08) != 0);
 			hide_cursor = ((buffer[1] & 0x10) != 0);
+			bool has_print_dir = ((buffer[1] & 0x20) != 0);
 			if((buffer[2] != 0 || buffer[3] != 0) && (buffer[4] != 0 || buffer[5] != 0)) {
 				buf_width  = buffer[2] | (buffer[3] << 8);
 				buf_height = buffer[4] | (buffer[5] << 8);
@@ -4639,6 +4641,17 @@ int main(int argc, char *argv[], char *envp[])
 			}
 			fclose(fo);
 			
+			// -o folder (flags2 & 0x20)
+			if(has_print_dir) {
+				UINT8 odbuf[2];
+				if(fread(odbuf, 2, 1, fp) == 1) {
+					int pd_len = odbuf[0] | (odbuf[1] << 8);
+					if(pd_len > 0 && pd_len < MAX_PATH) {
+						memset(print_dir, 0, sizeof(print_dir));
+						fread(print_dir, pd_len, 1, fp);
+					}
+				}
+			}
 			MyGetFullPathNameA(dummy_argv_1, MAX_PATH, temp_file_path, NULL);
 			temp_file_created = true;
 			MySetFileAttributesA(temp_file_path, FILE_ATTRIBUTE_HIDDEN);
@@ -4776,6 +4789,15 @@ int main(int argc, char *argv[], char *envp[])
 		} else if(_strnicmp(argv[i], "-h", 2) == 0) {
 			hide_cursor = true;
 			arg_offset++;
+		} else if(_strnicmp(argv[i], "-o", 2) == 0) {
+			const char *val = &argv[i][2];
+			if(*val == '=' || *val == ':') {
+				val++;
+			}
+			if(*val != '\0') {
+				my_strcpy_s(print_dir, MAX_PATH, val);
+			}
+			arg_offset++;
 		} else {
 			break;
 		}
@@ -4798,7 +4820,7 @@ int main(int argc, char *argv[], char *envp[])
 			"Usage:\n\n"
 			"MSDOS [-b] [-c[(new exec file)] [-p[P]]] [-d] [-e] [-fN] [-i] [-m] [-n[L[,C]]]\n"
 			"      [-s[P1[,P2[,P3[,P4]]]]] [-sd] [-sc] [-vm|vc] [-vX.XX] [-wX.XX] [-x] [-a]\n"
-			"      [-ld[(drivers)]] [-l] [-vt] [-g] [-h] (command) [options]\n"
+			"      [-ld[(drivers)]] [-l] [-vt] [-g] [-h] [-o(dir)] (command) [options]\n"
 			"\n"
 			"\t-b\tstay busy during keyboard polling\n"
 #ifdef _WIN64
@@ -4833,6 +4855,7 @@ int main(int argc, char *argv[], char *envp[])
 			"\t-vt\ttoggle vt mode, default is on for win10 and above\n"
 			"\t-g\tuse cp437 glyphs for code points 0-31, always enabled in cp437\n"
 			"\t-h\tallow making cursor invisible\n"
+			"\t-o\tset folder for printer (.PRN) output, default is the temp folder\n"
 		);
 		
 		if(!started_from_console) {
@@ -4951,6 +4974,9 @@ int main(int argc, char *argv[], char *envp[])
 					if(hide_cursor) {
 						flags2 |= 0x10;
 					}
+					if(print_dir[0] != '\0') {
+						flags2 |= 0x20;
+					}
 					fputc(flags, fo);
 					fputc(flags2, fo);
 					fputc((buf_width  >> 0) & 0xff, fo);
@@ -4999,6 +5025,14 @@ int main(int argc, char *argv[], char *envp[])
 						}
 					}
 					
+					// -o folder
+					int print_dir_len = (int)strlen(print_dir);
+					if(print_dir[0] != '\0') {
+						fputc((print_dir_len >> 0) & 0xff, fo);
+						fputc((print_dir_len >> 8) & 0xff, fo);
+						fwrite(print_dir, print_dir_len, 1, fo);
+					}
+					
 					// store padding data and update pe header
 					_IMAGE_SECTION_HEADER *newSectionHeader = (_IMAGE_SECTION_HEADER *)(header + dwTopOfFirstSectionHeader + IMAGE_SIZEOF_SECTION_HEADER * coffHeader->NumberOfSections);
 					coffHeader->NumberOfSections++;
@@ -5007,7 +5041,7 @@ int main(int argc, char *argv[], char *envp[])
 					newSectionHeader->VirtualAddress = dwVirtualAddress;
 					newSectionHeader->PointerToRawData = dwEndOfFile;
 					newSectionHeader->Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_DISCARDABLE;
-					newSectionHeader->SizeOfRawData = 14 + name_len + file_size;
+					newSectionHeader->SizeOfRawData = 14 + name_len + file_size + (print_dir[0] != '\0' ? 2 + print_dir_len : 0);
 					DWORD dwExtraRawBytes = newSectionHeader->SizeOfRawData % optionalHeader->FileAlignment;
 					if(dwExtraRawBytes != 0) {
 						static const char padding[] = "PADDINGXXPADDING";
@@ -24716,6 +24750,32 @@ UINT8 pio_read(int c, UINT32 addr)
 	return(0xff);
 }
 
+// create dir and any missing parents
+static void create_dir_tree(const char *dir)
+{
+	char tmp[MAX_PATH];
+	size_t len;
+	
+	if(dir == NULL || dir[0] == '\0') {
+		return;
+	}
+	strncpy(tmp, dir, MAX_PATH - 1);
+	tmp[MAX_PATH - 1] = '\0';
+	len = strlen(tmp);
+	if(len > 0 && (tmp[len - 1] == '\\' || tmp[len - 1] == '/')) {
+		tmp[len - 1] = '\0';
+	}
+	for(char *p = tmp + 1; *p != '\0'; p++) {
+		if(*p == '\\' || *p == '/') {
+			char ch = *p;
+			*p = '\0';
+			CreateDirectoryA(tmp, NULL);
+			*p = ch;
+		}
+	}
+	CreateDirectoryA(tmp, NULL);
+}
+
 void printer_out(int c, UINT8 data)
 {
 	SYSTEMTIME time;
@@ -24744,11 +24804,23 @@ void printer_out(int c, UINT8 data)
 		}
 	}
 	if(pio[c].fp == NULL) {
-		// create a new file in the temp folder
+		// create a new file in the output folder
 		char file_name[MAX_PATH];
 		
 		sprintf(file_name, "%d-%0.2d-%0.2d_%0.2d-%0.2d-%0.2d.PRN", time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond);
-		if(GetTempPathA(MAX_PATH, pio[c].path)) {
+		if(print_dir[0] != '\0') {
+			char base[MAX_PATH];
+			if(ExpandEnvironmentStringsA(print_dir, base, MAX_PATH) == 0) {
+				strcpy(base, print_dir);
+			}
+			create_dir_tree(base);
+			strcpy(pio[c].path, base);
+			size_t plen = strlen(pio[c].path);
+			if(plen > 0 && pio[c].path[plen - 1] != '\\' && pio[c].path[plen - 1] != '/') {
+				strcat(pio[c].path, "\\");
+			}
+			strcat(pio[c].path, file_name);
+		} else if(GetTempPathA(MAX_PATH, pio[c].path)) {
 			strcat(pio[c].path, file_name);
 		} else {
 			strcpy(pio[c].path, file_name);
