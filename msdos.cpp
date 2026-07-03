@@ -69,7 +69,7 @@ void nolog(const char *format, ...)
 		#define unimplemented_xms fatalerror
 	#endif
 	bool debug_trace = false;
-
+	
 	#ifdef ENABLE_DEBUG_IOPORT
 		int skip_debug_ioport = 0;
 	#endif
@@ -1396,7 +1396,7 @@ UINT32 read_word(UINT32 byteaddress)
 	if(byteaddress < MAX_MEM - 1) {
 		if(byteaddress == 0x41c) {
 			// pointer to first free slot in keyboard buffer
-			if(key_buf_char != NULL && key_buf_scan != NULL) {
+			if(kbc_buffer != NULL) {
 				enter_key_buf_lock();
 				bool empty = pcbios_is_key_buffer_empty();
 				leave_key_buf_lock();
@@ -3155,7 +3155,7 @@ void debugger_main()
 					} else {
 						if((fp = fopen(file_path, "wb")) != NULL) {
 							for(UINT32 addr = start_addr; addr <= end_addr; addr++) {
-								fputc(read_byte(addr & ADDR_MASK),fp);
+								fputc(read_byte(addr & ADDR_MASK), fp);
 							}
 							fclose(fp);
 						} else {
@@ -3662,6 +3662,10 @@ void debugger_main()
 				telnet_printf("G <address> - go and break at address\n");
 				telnet_printf("P - trace one opcode (step over)\n");
 				telnet_printf("T [<count>] - trace (step in)\n");
+#ifdef ENABLE_DEBUG_LOG
+				telnet_printf("TE - enable debug trace\n");
+				telnet_printf("TD - disable debug trace\n");
+#endif
 				telnet_printf("Q - quit\n");
 				telnet_printf("X - show dos process info\n");
 #if defined(HAS_I386)
@@ -3853,7 +3857,7 @@ DWORD WINAPI debugger_thread(LPVOID)
 BOOL WINAPI ctrl_handler(DWORD dwCtrlType)
 {
 	if(dwCtrlType == CTRL_BREAK_EVENT) {
-		if(key_buf_char != NULL && key_buf_scan != NULL) {
+		if(kbc_buffer != NULL) {
 			enter_key_buf_lock();
 			pcbios_clear_key_buffer();
 			leave_key_buf_lock();
@@ -3876,21 +3880,21 @@ void exit_handler()
 		MyDeleteFileA(temp_file_path);
 		temp_file_created = false;
 	}
-	if(key_buf_char != NULL) {
-		key_buf_char->release();
-		delete key_buf_char;
-		key_buf_char = NULL;
+	if(kbc_buffer != NULL) {
+		kbc_buffer->release();
+		delete kbc_buffer;
+		kbc_buffer = NULL;
 	}
-	if(key_buf_scan != NULL) {
-		key_buf_scan->release();
-		delete key_buf_scan;
-		key_buf_scan = NULL;
+	if(key_buffer != NULL) {
+		key_buffer->release();
+		delete key_buffer;
+		key_buffer = NULL;
 	}
-	if(key_buf_data != NULL) {
-		key_buf_data->release();
-		delete key_buf_data;
-		key_buf_data = NULL;
+#ifdef EXPORT_DEBUG_TO_FILE
+	if(fp_debug_log != NULL) {
+		fflush(fp_debug_log);
 	}
+#endif
 	if(use_vt) {
 		WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\x1b[!p\x1b[0 q", 9, NULL, NULL);
 		WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\x1b[?1049l", 8, NULL, NULL);
@@ -5171,9 +5175,8 @@ int main(int argc, char *argv[], char *envp[])
 	cursor_moved = false;
 	cursor_moved_by_crtc = false;
 	
-	key_buf_char = new FIFO(4096);
-	key_buf_scan = new FIFO(4096);
-	key_buf_data = new FIFO(256);
+	kbc_buffer = new FIFO(4096);
+	key_buffer = new FIFO(4096);
 	
 	hardware_init();
 	
@@ -5298,20 +5301,15 @@ int main(int argc, char *argv[], char *envp[])
 	}
 	hardware_finish();
 	
-	if(key_buf_char != NULL) {
-		key_buf_char->release();
-		delete key_buf_char;
-		key_buf_char = NULL;
+	if(kbc_buffer != NULL) {
+		kbc_buffer->release();
+		delete kbc_buffer;
+		kbc_buffer = NULL;
 	}
-	if(key_buf_scan != NULL) {
-		key_buf_scan->release();
-		delete key_buf_scan;
-		key_buf_scan = NULL;
-	}
-	if(key_buf_data != NULL) {
-		key_buf_data->release();
-		delete key_buf_data;
-		key_buf_data = NULL;
+	if(key_buffer != NULL) {
+		key_buffer->release();
+		delete key_buffer;
+		key_buffer = NULL;
 	}
 	if(use_service_thread) {
 		DeleteCriticalSection(&input_crit_sect);
@@ -5479,13 +5477,13 @@ bool update_console_input()
 				if(chr1 == 0x00 || chr1 == 0xe0) {
 					chr2 = _getch();
 				}
-				if(key_buf_char != NULL && key_buf_scan != NULL) {
+				if(kbc_buffer != NULL) {
 					enter_key_buf_lock();
 					if(chr1 == 0x00 || chr1 == 0xe0) {
-						pcbios_set_key_buffer(0x00, chr1);
-						pcbios_set_key_buffer(0x00, chr2);
+						set_kbc_buffer(0x00, chr1, 0x00);
+						set_kbc_buffer(0x00, chr2, 0x00);
 					} else {
-						pcbios_set_key_buffer(chr1, 0x00);
+						set_kbc_buffer(chr1, 0x00, 0x00);
 					}
 					leave_key_buf_lock();
 				}
@@ -5613,11 +5611,6 @@ bool update_console_input()
 						mem[0x418] &= ~0x01;
 					}
 					
-					// set scan code of last pressed/release key to kbd_data (in-port 60h)
-//					kbd_data = ir[i].Event.KeyEvent.wVirtualScanCode;
-//					kbd_status |= 1;
-					UINT8 tmp_data = ir[i].Event.KeyEvent.wVirtualScanCode;
-					
 					// update dos key buffer
 					UINT8 chr = ir[i].Event.KeyEvent.uChar.AsciiChar;
 					UINT8 scn = ir[i].Event.KeyEvent.wVirtualScanCode & 0xff;
@@ -5625,7 +5618,7 @@ bool update_console_input()
 					
 					if(ir[i].Event.KeyEvent.bKeyDown) {
 						// make
-						tmp_data &= 0x7f;
+						UINT8 port_data = scn & 0x7f;
 						
 						if(ir[i].Event.KeyEvent.dwControlKeyState & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) {
 							if(scn == 0x0e) {
@@ -5704,16 +5697,16 @@ bool update_console_input()
 							}
 							// ignore Shift, Ctrl, Alt, Win and Menu keys
 							if(scn != 0x1d && scn != 0x2a && scn != 0x36 && scn != 0x38 && !(scn >= 0x5b && scn <= 0x5d && scn == scn_old)) {
-								if(key_buf_char != NULL && key_buf_scan != NULL) {
+								if(kbc_buffer != NULL) {
 									enter_key_buf_lock();
 									if(chr == 0) {
 										if(scn >= 0x78 && scn != 0x84) {
-											pcbios_set_key_buffer(0x00, 0x00);
+											set_kbc_buffer(0x00, 0x00, 0x00);
 										} else {
-											pcbios_set_key_buffer(0x00, ir[i].Event.KeyEvent.dwControlKeyState & ENHANCED_KEY ? 0xe0 : 0x00);
+											set_kbc_buffer(0x00, ir[i].Event.KeyEvent.dwControlKeyState & ENHANCED_KEY ? 0xe0 : 0x00, 0x00);
 										}
 									}
-									pcbios_set_key_buffer(chr, scn);
+									set_kbc_buffer(chr, scn, port_data);
 									leave_key_buf_lock();
 								}
 							}
@@ -5735,47 +5728,38 @@ bool update_console_input()
 									scn = 0xe0;	// Keypad /, Enter
 								}
 							}
-							if(key_buf_char != NULL && key_buf_scan != NULL) {
+							if(kbc_buffer != NULL) {
 								enter_key_buf_lock();
 								if(chr == 0) {
-									pcbios_set_key_buffer(0x00, 0x00);
+									set_kbc_buffer(0x00, 0x00, 0x00);
 								}
-								pcbios_set_key_buffer(chr, scn);
+								set_kbc_buffer(chr, scn, port_data);
 								leave_key_buf_lock();
 							}
 						}
 					} else {
+						// break
+						UINT8 port_data = scn | 0x80;
+						
 						if(chr == 0x03 && (ir[i].Event.KeyEvent.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))) {
 							// Ctrl + Break, Ctrl + C
 							if(scn == 0x46) {
-								if(key_buf_char != NULL && key_buf_scan != NULL) {
+								if(kbc_buffer != NULL) {
 									enter_key_buf_lock();
-									pcbios_set_key_buffer(0x00, 0x00);
+									set_kbc_buffer(0x00, 0x00, port_data);
 									leave_key_buf_lock();
 								}
 								ctrl_break_pressed = true;
 								mem[0x471] = 0x80;
 								raise_int_1bh = true;
 							} else {
-								if(key_buf_char != NULL && key_buf_scan != NULL) {
+								if(kbc_buffer != NULL) {
 									enter_key_buf_lock();
-									pcbios_set_key_buffer(chr, scn);
+									set_kbc_buffer(chr, scn, port_data);
 									leave_key_buf_lock();
 								}
 								ctrl_c_pressed = (scn == 0x2e);
 							}
-						}
-						// break
-						tmp_data |= 0x80;
-					}
-					if(!(kbd_status & 1)) {
-						kbd_data = tmp_data;
-						kbd_status |= 1;
-					} else {
-						if(key_buf_data != NULL) {
-							enter_key_buf_lock();
-							key_buf_data->write(tmp_data);
-							leave_key_buf_lock();
 						}
 					}
 					result = key_changed = true;
@@ -5797,16 +5781,41 @@ bool update_console_input()
 
 bool update_key_buffer()
 {
-	if(update_console_input()) {
-		return(true);
-	}
-	if(key_buf_char != NULL && key_buf_scan != NULL) {
+	// this function makes key buffer not empty just now, without waiting IRQ 1 raised
+	bool buf_empty = true;
+	bool kbc_empty = true;
+	
+	if(kbc_buffer != NULL) {
 		enter_key_buf_lock();
-		bool empty = pcbios_is_key_buffer_empty();
+		buf_empty = pcbios_is_key_buffer_empty();
 		leave_key_buf_lock();
-		if(!empty) return(true);
 	}
-	return(false);
+	if(buf_empty) {
+		if(kbc_buffer != NULL) {
+			enter_key_buf_lock();
+			kbc_empty  = kbc_buffer->empty();
+			leave_key_buf_lock();
+			
+			if(kbc_empty) {
+				if(update_console_input()) {
+					kbc_empty = false;
+				}
+			}
+		}
+		if(kbc_buffer != NULL) {
+			if(!kbc_empty) {
+				enter_key_buf_lock();
+				if(!kbc_buffer->empty()) {
+					int key_data = kbc_buffer->read();
+					pcbios_set_key_buffer((UINT8)(key_data & 0xff), (UINT8)((key_data >> 8) & 0xff));
+					kbd_read_data(); // clear OUTBF
+					buf_empty = false; //pcbios_is_key_buffer_empty();
+				}
+				leave_key_buf_lock();
+			}
+		}
+	}
+	return(!buf_empty);
 }
 
 /* ----------------------------------------------------------------------------
@@ -7145,7 +7154,11 @@ int msdos_open(const char *path, int oflag)
 	}
 	
 	int fd = _open_osfhandle((intptr_t) h, oflag);
-	if(fd == -1) {
+	if(fd >= max_files) {
+		_close(fd);
+		fd = -1;
+		_doserrno = ERROR_TOO_MANY_OPEN_FILES;
+	} else if(fd == -1) {
 		CloseHandle(h);
 	}
 	return(fd);
@@ -7488,7 +7501,7 @@ int msdos_kbhit()
 	if(key_recv != 0) {
 		return(1);
 	}
-	if(key_buf_char != NULL && key_buf_scan != NULL) {
+	if(kbc_buffer != NULL) {
 		enter_key_buf_lock();
 		bool empty = pcbios_is_key_buffer_empty();
 		leave_key_buf_lock();
@@ -7530,15 +7543,15 @@ retry:
 	}
 	
 	// input from console
-	int key_char = 0, key_scan = 0;
+	UINT8 key_char = 0, key_scan = 0;
 	if(key_recv != 0) {
 		key_char = (key_code >> 0) & 0xff;
 		key_scan = (key_code >> 8) & 0xff;
 		key_code >>= 16;
 		key_recv >>= 16;
 	} else {
-		while(key_buf_char != NULL && key_buf_scan != NULL && !msdos_exit) {
-			if(key_buf_char != NULL && key_buf_scan != NULL) {
+		while(kbc_buffer != NULL && !msdos_exit) {
+			if(kbc_buffer != NULL) {
 				enter_key_buf_lock();
 				bool empty = pcbios_is_key_buffer_empty();
 				leave_key_buf_lock();
@@ -7547,12 +7560,12 @@ retry:
 			if(!(fd < process->max_files && file_handler[fd].valid && file_handler[fd].atty && file_mode[file_handler[fd].mode].in)) {
 				// NOTE: stdin is redirected to stderr when we do "type (file) | more" on freedos's command.com
 				if(_kbhit()) {
-					int chr1 = _getch();
-					int chr2 = 0;
+					UINT8 chr1 = (UINT8)_getch();
+					UINT8 chr2 = 0;
 					if(chr1 == 0x00 || chr1 == 0xe0) {
-						chr2 = _getch();
+						chr2 = (UINT8)_getch();
 					}
-					if(key_buf_char != NULL && key_buf_scan != NULL) {
+					if(kbc_buffer != NULL) {
 						enter_key_buf_lock();
 						if(chr1 == 0x00 || chr1 == 0xe0) {
 							pcbios_set_key_buffer(0x00, chr1);
@@ -7575,7 +7588,7 @@ retry:
 			// insert CR to terminate input loops
 			key_char = 0x0d;
 			key_scan = 0;
-		} else if(key_buf_char != NULL && key_buf_scan != NULL) {
+		} else if(kbc_buffer != NULL) {
 			enter_key_buf_lock();
 			pcbios_get_key_buffer(&key_char, &key_scan);
 			leave_key_buf_lock();
@@ -7978,7 +7991,7 @@ void msdos_putch_tmp(UINT8 data, unsigned int_num, UINT8 reg_ah)
 						char tmp[16];
 						sprintf(tmp, "\x1b[%d;%dR", co.Y + 1, co.X + 1);
 						int len = (int)strlen(tmp);
-						if(key_buf_char != NULL && key_buf_scan != NULL) {
+						if(kbc_buffer != NULL) {
 							enter_key_buf_lock();
 							for(int i = 0; i < len; i++) {
 								pcbios_set_key_buffer(tmp[i], 0x00);
@@ -9903,7 +9916,7 @@ int msdos_process_exec(const char *cmd, param_block_t *param, UINT8 al, bool fir
 			UINT16 machine = *(UINT16 *)(file_buffer + e_lfanew + 0x04);
 			UINT16 subsys = *(UINT16 *)(file_buffer + e_lfanew + 0x5c);
 			if(sign_nt == IMAGE_NT_SIGNATURE && (machine == IMAGE_FILE_MACHINE_I386 || machine == IMAGE_FILE_MACHINE_AMD64)) {
-				char tmp[MAX_PATH];
+				char tmp[MAX_PATH * 2];
 				if(opt[0] != '\0') {
 					sprintf(tmp, "\"%s\" %s", path, opt);
 				} else {
@@ -10536,6 +10549,21 @@ int get_scan_lines()
 	return 400;
 }
 
+#if 0
+int get_default_char_height()
+{
+	switch(mem[0x489] & 0x90) {
+	case 0x00:
+		return 14;
+	case 0x10:
+		return 16;
+	case 0x80:
+		return 8;
+	}
+	return 16;
+}
+#endif
+
 inline void pcbios_int_10h_00h()
 {
 	if(video_card_type == VIDEO_CARD_MDA) {
@@ -10555,15 +10583,11 @@ inline void pcbios_int_10h_00h()
 	case 0x71: // Extended CGA V-Text Mode
 		pcbios_set_console_size(scr_width, scr_height, !(CPU_AL & 0x80));
 		break;
-	case 0x03: // CGA Text Mode
-		change_console_size(80, 25); // for Windows10
-		pcbios_set_font_size(font_width, font_height);
-		pcbios_set_console_size(80, get_scan_lines() / 16, !(CPU_AL & 0x80));
-		break;
 	case 0x73: // Extended CGA Text Mode
 	case 0x74: // J-3100 DCGA (mono)
 	case 0x75: // J-3100 DCGA
 	case 0x02: // CGA Text Mode (gray)
+	case 0x03: // CGA Text Mode
 	case 0x07: // MDA Text Mode (mono)
 		change_console_size(80, 25); // for Windows10
 		pcbios_set_font_size(font_width, font_height);
@@ -12833,14 +12857,18 @@ int pcbios_get_key_buffer_count()
 
 void pcbios_clear_key_buffer()
 {
-	key_buf_char->clear();
-	key_buf_scan->clear();
+	if(kbc_buffer != NULL) {
+		kbc_buffer->clear();
+	}
+	if(key_buffer != NULL) {
+		key_buffer->clear();
+	}
 	
 	// update key buffer
 	*(UINT16 *)(mem + 0x41a) = *(UINT16 *)(mem + 0x41c); // head = tail
 }
 
-void pcbios_set_key_buffer(int key_char, int key_scan)
+void pcbios_set_key_buffer(UINT8 key_char, UINT8 key_scan)
 {
 	// update key buffer
 	UINT16 head = *(UINT16 *)(mem + 0x41a);
@@ -12855,14 +12883,13 @@ void pcbios_set_key_buffer(int key_char, int key_scan)
 		mem[0x400 + (tail++)] = key_scan;
 	} else {
 		// store to extra key buffer
-		if(key_buf_char != NULL && key_buf_scan != NULL) {
-			key_buf_char->write(key_char);
-			key_buf_scan->write(key_scan);
+		if(key_buffer != NULL) {
+			key_buffer->write(key_char | (key_scan << 8));
 		}
 	}
 }
 
-bool pcbios_get_key_buffer(int *key_char, int *key_scan)
+bool pcbios_get_key_buffer(UINT8 *key_char, UINT8 *key_scan)
 {
 	// update key buffer
 	UINT16 head = *(UINT16 *)(mem + 0x41a);
@@ -12877,9 +12904,10 @@ bool pcbios_get_key_buffer(int *key_char, int *key_scan)
 		*key_scan = mem[0x400 + (head++)];
 		
 		// restore from extra key buffer
-		if(key_buf_char != NULL && key_buf_scan != NULL) {
-			if(!key_buf_char->empty()) {
-				pcbios_set_key_buffer(key_buf_char->read(), key_buf_scan->read());
+		if(key_buffer != NULL) {
+			if(!key_buffer->empty()) {
+				int key_data = key_buffer->read();
+				pcbios_set_key_buffer((UINT8)(key_data & 0xff), (UINT8)((key_data >> 8) & 0xff));
 			}
 		}
 		return(true);
@@ -12887,6 +12915,13 @@ bool pcbios_get_key_buffer(int *key_char, int *key_scan)
 		*key_char = 0x00;
 		*key_scan = 0x00;
 		return(false);
+	}
+}
+
+void set_kbc_buffer(UINT8 key_char, UINT8 key_scan, UINT8 port_data)
+{
+	if(kbc_buffer != NULL) {
+		kbc_buffer->write(key_char | (key_scan << 8) | (port_data << 16));
 	}
 }
 
@@ -12908,7 +12943,7 @@ bool pcbios_check_key_buffer(int *key_char, int *key_scan)
 
 void pcbios_update_key_code(bool wait)
 {
-	if(key_buf_char != NULL && key_buf_scan != NULL) {
+	if(kbc_buffer != NULL) {
 		enter_key_buf_lock();
 		bool empty = pcbios_is_key_buffer_empty();
 		leave_key_buf_lock();
@@ -12922,13 +12957,20 @@ void pcbios_update_key_code(bool wait)
 			}
 		}
 	}
-	if(key_buf_char != NULL && key_buf_scan != NULL) {
+	if(kbc_buffer != NULL) {
 		enter_key_buf_lock();
-		int key_char, key_scan;
+		UINT8 key_char, key_scan;
 		if(pcbios_get_key_buffer(&key_char, &key_scan)) {
 			key_code  = key_char << 0;
 			key_code |= key_scan << 8;
 			key_recv  = 0x0000ffff;
+			// we want to read another code
+			if(pcbios_is_key_buffer_empty()) {
+				if(!kbc_buffer->empty()) {
+					int key_data = kbc_buffer->read();
+					pcbios_set_key_buffer((UINT8)(key_data & 0xff), (UINT8)((key_data >> 8) & 0xff));
+				}
+			}
 		}
 		if(pcbios_get_key_buffer(&key_char, &key_scan)) {
 			key_code |= key_char << 16;
@@ -12941,7 +12983,7 @@ void pcbios_update_key_code(bool wait)
 
 DWORD WINAPI pcbios_int_16h_00h_thread(LPVOID)
 {
-	while(key_recv == 0 && !msdos_exit) {
+	while(key_recv == 0 && kbc_buffer != NULL && !msdos_exit) {
 		pcbios_update_key_code(true);
 	}
 	if((key_recv & 0x0000ffff) && (key_recv & 0xffff0000)) {
@@ -13050,7 +13092,7 @@ inline void pcbios_int_16h_03h()
 
 inline void pcbios_int_16h_05h()
 {
-	if(key_buf_char != NULL && key_buf_scan != NULL) {
+	if(kbc_buffer != NULL) {
 		enter_key_buf_lock();
 		pcbios_set_key_buffer(CPU_CL, CPU_CH);
 		leave_key_buf_lock();
@@ -19839,11 +19881,13 @@ inline void msdos_int_33h_0001h()
 inline void msdos_int_33h_0002h()
 {
 	mouse.hidden++;
-	WORD bx = CPU_BX;
-	CPU_AX = 0x0000;
-	CPU_BX = 0x0000;
-	pcbios_int_15h_c2h();
-	CPU_BX = bx;
+	if(!mouse.call_addr.dw || !(mouse.call_mask & 0x7f)) {
+		WORD bx = CPU_BX;
+		CPU_AX = 0x0000;
+		CPU_BX = 0x0000;
+		pcbios_int_15h_c2h();
+		CPU_BX = bx;
+	}
 }
 
 inline void msdos_int_33h_0003h()
@@ -21883,6 +21927,8 @@ inline void msdos_dec_indos()
 
 void msdos_syscall(unsigned num)
 {
+	UINT16 key_buffer_head = 0;
+	
 #ifdef ENABLE_DEBUG_SYSCALL
 	if(num == 0x08 || num == 0x1c) {
 		// don't log the timer interrupts
@@ -21936,13 +21982,49 @@ void msdos_syscall(unsigned num)
 #ifdef SUPPORT_VDD
 		try {
 			UINT8 *opcode = mem + CPU_TRANS_CODE_ADDR(CPU_CS, CPU_EIP);
-			if((opcode[0] == 0xc4) && (opcode[1] == 0xc4) && (opcode[2] == 0x58)) {
-				vdd_req(opcode[3]);
-				break;
-			}
-			if((opcode[0] == 0xc4) && (opcode[1] == 0xc4) && (opcode[2] == 0xfe)) {
-				// VDDUnSimulate16
-				msdos_stat |= REQ_UNSIM16;
+			if(opcode[0] == 0xc4 && opcode[1] == 0xc4) {
+				if(opcode[2] == 0x00) {
+					// Terminate VDM BOP
+					CPU_EIP += 3;
+					msdos_stat |= REQ_EXIT;
+				} else if(opcode[2] == 0x51 && opcode[3] == 0x02) {
+					// WOW32 User/Task BOP, WOW_YIELD
+					CPU_EIP += 4;
+					Sleep(0);
+					CPU_SET_C_FLAG(0);
+					CPU_AX = 0x0000;
+				} else if(opcode[2] == 0x54) {
+					// Command/Console BOP
+					CPU_EIP += 4;
+					cmd_req(opcode[3]);
+				} else if(opcode[2] == 0x58) {
+					// VDD BOP
+					CPU_EIP += 4;
+					vdd_req(opcode[3]);
+				} else if(opcode[2] == 0x60) {
+					// NTVDM Get Version BOP
+					CPU_EIP += 3;
+					CPU_SET_C_FLAG(0);
+					if(win_major_version >= 4) {
+						CPU_AX = 0x0400; // Windows NT 4.0 or later
+					} else {
+						CPU_AX = 0x0300; // Windows NT 3.51 or prior
+					}
+				} else if(opcode[2] == 0xfe) {
+					// VDDUnSimulate16 BOP
+					CPU_EIP += 3;
+					msdos_stat |= REQ_UNSIM16;
+				} else if(opcode[2] == 0x50 || opcode[2] == 0x51 || (opcode[2] >= 0x08 && opcode[2] <= 0x0f)) {
+					// Known BOP containing 4 bytes
+					CPU_EIP += 4;
+					CPU_SET_C_FLAG(1);
+					CPU_AX = 0xffff;
+				} else {
+					// Unknown BOP, probably 3 bytes
+					CPU_EIP += 3;
+					CPU_SET_C_FLAG(1);
+					CPU_AX = 0xffff;
+				}
 				break;
 			}
 		} catch(...) {
@@ -21967,6 +22049,19 @@ void msdos_syscall(unsigned num)
 		}
 		break;
 	case 0x09:
+		enter_key_buf_lock();
+		if(kbc_buffer != NULL && !kbc_buffer->empty()) {
+			if(!(kbd_status & 1)) {
+				// keyboard data is already read, so BIOS cannot read it :-(
+				kbc_buffer->read();
+			} else if(!pcbios_is_key_buffer_full()) {
+				// keyboard data is read by PC BIOS and pushed into key buffer
+				int key_data = kbc_buffer->read();
+				pcbios_set_key_buffer((UINT8)(key_data & 0xff), (UINT8)((key_data >> 8) & 0xff));
+				kbd_read_data(); // clear OUTBF
+			}
+		}
+		leave_key_buf_lock();
 		// ctrl-break is pressed
 		if(raise_int_1bh) {
 			CPU_SOFT_INTERRUPT(0x1b);
@@ -22162,6 +22257,7 @@ void msdos_syscall(unsigned num)
 	case 0x16:
 		// PC BIOS - Keyboard
 		CPU_SET_C_FLAG(0);
+		key_buffer_head = *(UINT16 *)(mem + 0x41a);
 		switch(CPU_AH) {
 		case 0x00: pcbios_int_16h_00h(); break;
 		case 0x01: pcbios_int_16h_01h(); break;
@@ -22189,6 +22285,22 @@ void msdos_syscall(unsigned num)
 		default:
 			unimplemented_16h("int %02Xh (AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X DS=%04X ES=%04X)\n", num, CPU_AX, CPU_BX, CPU_CX, CPU_DX, CPU_SI, CPU_DI, CPU_DS, CPU_ES);
 			break;
+		}
+		// if key buffer is read and becomes empty, and keyboard controller buffer has data,
+		// raise IRQ 1 just now to update key buffer
+		if(!(kbd_status & 1) && key_buffer_head != *(UINT16 *)(mem + 0x41a)) {
+			if(kbc_buffer != NULL) {
+				enter_key_buf_lock();
+				if(pcbios_is_key_buffer_empty()) {
+					if(!kbc_buffer->empty()) {
+						int key_data = kbc_buffer->read_not_remove(0);
+						kbd_data = (UINT8)((key_data >> 16) & 0xff);
+						kbd_status |= 1;
+						pic_req(0, 1, 1);
+					}
+				}
+				leave_key_buf_lock();
+			}
 		}
 		break;
 	case 0x17:
@@ -22249,6 +22361,26 @@ void msdos_syscall(unsigned num)
 //			break;
 //		}
 	case 0x21:
+		if(num == 0x21 && CPU_AH != 0x50 && CPU_AH != 0x51 && CPU_AH != 0x62 && CPU_AH != 0x64 && CPU_AH < 0x6c) {
+			// from DOSBox commit r4481 (Push registers for most DOS function calls)
+			// This pretends INT 21h service pushes function entry registers onto the stack
+			// and will fix crashes in specific utilities like UNLZEX
+			
+			// NOTE: IRET is already executed to leave INT 21h handler when we reach here
+			// so IP, CS, and EFlags are at the top of dead stack
+//			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP -  2) = CPU_EIP;
+//			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP -  4) = CPU_CS;
+//			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP -  6) = CPU_EFLAG;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP -  8) = CPU_ES;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 10) = CPU_DS;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 12) = CPU_BP;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 14) = CPU_DI;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 16) = CPU_SI;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 18) = CPU_DX;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 20) = CPU_CX;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 22) = CPU_BX;
+			*(UINT16 *)(mem + CPU_SS_BASE + CPU_SP - 24) = CPU_AX;
+		}
 		// MS-DOS System Call
 		msdos_inc_indos();
 		CPU_SET_C_FLAG(0);
@@ -24016,42 +24148,30 @@ void hardware_update()
 			if(!key_changed || mouse.hidden == 0) {
 				update_console_input();
 			}
+			
+			// raise IRQ 1 if key is pressed/released or key buffer is not empty
 			if(!(kbd_status & 1)) {
-				if(key_buf_data != NULL) {
+				if(kbc_buffer != NULL) {
 					enter_key_buf_lock();
-					if(!key_buf_data->empty()) {
-						kbd_data = key_buf_data->read();
+					if(!kbc_buffer->empty()) {
+						// show top key data in keyboard controller buffer
+						// it will be removed from buffer in IRQ 1 handler
+						int key_data = kbc_buffer->read_not_remove(0);
+						kbd_data = (UINT8)((key_data >> 16) & 0xff);
 						kbd_status |= 1;
-						key_changed = true;
+					} else if(!pcbios_is_key_buffer_empty()) {
+						// we want to raise IRQ 1 to notify key buffer is not empty,
+						// but we have no key data in keyboard controller buffer
+						kbd_data = 0;
+						kbd_status |= 1;
 					}
 					leave_key_buf_lock();
 				}
 			}
-			
-			// raise IRQ 1 if key is pressed/released or key buffer is not empty
-			if(!key_changed) {
-				enter_key_buf_lock();
-				if(!pcbios_is_key_buffer_empty()) {
-/*
-					if(!(kbd_status & 1)) {
-						UINT16 head = *(UINT16 *)(mem + 0x41a);
-						UINT16 tail = *(UINT16 *)(mem + 0x41c);
-						if(head != tail) {
-							int key_char = mem[0x400 + (head++)];
-							int key_scan = mem[0x400 + (head++)];
-							kbd_data = key_char ? key_char : key_scan;
-							kbd_status |= 1;
-						}
-					}
-*/
-					key_changed = true;
-				}
-				leave_key_buf_lock();
-			}
-			if(key_changed) {
+			if(kbd_status & 1) {
 				pic_req(0, 1, 1);
-				key_changed = false;
 			}
+			key_changed = false;
 			
 			// raise IRQ 12 if mouse status is changed
 			if((mouse.status & 0x1f) && mouse.call_addr_ps2.dw && mouse.enabled_ps2) {
@@ -26634,6 +26754,51 @@ void write_io_dword(UINT32 addr, UINT32 val)
 }
 
 #ifdef SUPPORT_VDD
+void cmd_req(char func)
+{
+	switch(func) {
+	case 0x00: // BOP_CMD_INIT
+	case 0x02: // BOP_CMD_EXIT
+		CPU_SET_C_FLAG(0);
+		CPU_AX = 0x0000;
+		break;
+	case 0x01: // BOP_CMD_EXEC
+		{
+			// NOTE: BOP_CMD_EXEC is usually used to execute Win32 executables in INT 21h, AH=4Bh
+			// but msdos_process_exec() will execute Win32 executables directly,
+			// so this function is called only in the case application dare calls it
+			const char *path = (const char *)(mem + CPU_DS_BASE + CPU_DX);
+			param_block_t *param = (param_block_t *)(mem + CPU_ES_BASE + CPU_BX);
+			char opt[MAX_PATH], cmd[MAX_PATH * 2];
+			int opt_ofs = (param->cmd_line.w.h << 4) + param->cmd_line.w.l;
+			memset(opt, 0, sizeof(opt));
+			memcpy(opt, mem + opt_ofs + 1, (unsigned int)mem[opt_ofs]);
+			_snprintf(cmd, sizeof(cmd), "\"%s\" %s", path, opt);
+			if(system(cmd) == -1) {
+				CPU_SET_C_FLAG(1);
+				CPU_AX = 0x0002; // file not found
+			} else {
+				CPU_SET_C_FLAG(0);
+				CPU_AX = 0x0000;
+			}
+		}
+		break;
+	case 0x03: // BOP_CMD_CURDIR
+		if(my_chdir((char *)(mem + CPU_DS_BASE + CPU_SI))) {
+			CPU_SET_C_FLAG(1);
+			CPU_AX = 0x0003; // path not found
+		} else {
+			CPU_SET_C_FLAG(0);
+			CPU_AX = 0x0000;
+		}
+		break;
+	default:
+		CPU_SET_C_FLAG(1);
+		CPU_AX = 0xffff;
+		break;
+	}
+}
+
 void vdd_init()
 {
 /*
@@ -26709,18 +26874,32 @@ void vdd_req(char func)
 			vdd_init_table(&func);
 			pfnSetFuncTable(&func);
 		}
-		LPCSTR dll = (LPCSTR)(mem + CPU_ESI + CPU_DS_BASE);
-		LPCSTR init = (LPCSTR)(mem + CPU_EDI + CPU_ES_BASE);
-		LPCSTR dispatch = (LPCSTR)(mem + CPU_EBX + CPU_DS_BASE);
-		CPU_EIP += 4;
+		LPCSTR dll = (LPCSTR)(mem + CPU_DS_BASE + CPU_SI);
+		LPCSTR init = (LPCSTR)(mem + CPU_ES_BASE + CPU_DI);
+		LPCSTR dispatch = (LPCSTR)(mem + CPU_DS_BASE + CPU_BX);
 		HMODULE hVdd = LoadLibraryA(dll);
 		if (!hVdd) {
 			CPU_SET_C_FLAG(1);
-			CPU_AX = GetLastError();
+			CPU_AX = 0x0001; //GetLastError();
 			return;
 		}
 		FARPROC pfnInit = GetProcAddress(hVdd, init);
 		FARPROC pfnDispatch = GetProcAddress(hVdd, dispatch);
+		if (!pfnDispatch) {
+			FreeLibrary(hVdd);
+			CPU_SET_C_FLAG(1);
+			CPU_AX = 0x0002;
+			return;
+		}
+#if 0
+		// FIXME: not sure if init==NULL should be allowed
+		if (!pfnInit) {
+			FreeLibrary(hVdd);
+			CPU_SET_C_FLAG(1);
+			CPU_AX = 0x0003;
+			return;
+		}
+#endif
 		int i;
 		// Try to locate the handle in case it was already added to the list during DLL initialisation
 		for (i = 0; i < 5; i++) {
@@ -26742,20 +26921,31 @@ void vdd_req(char func)
 		if (i == 5) {
 			FreeLibrary(hVdd);
 			CPU_SET_C_FLAG(1);
-			CPU_AX = 4;
+			CPU_AX = 0x0004;
 			return;
 		}
 		CPU_SET_C_FLAG(0);
 		CPU_AX = i + 1;
 		if (pfnInit) {
+			pIntelRegister = (X86_CONTEXT*)(((ULONG_PTR)bytIntelRegister + 15) & ~15);
+			vdd_store_intel_register();
+#if defined(_MSC_VER) || (defined(__clang__) && (__clang_major__ > 3 || (__clang_major__ == 3 && __clang_minor__ >= 7)))
+			__try {
+				pfnInit();
+			} __except(EXCEPTION_EXECUTE_HANDLER) {
+				pIntelRegister->EFlags |= 0x1; // CF = 1
+				pIntelRegister->Eax |= 0xffff; // AX = FFFFh
+			}
+#else
 			pfnInit();
+#endif
+			vdd_restore_intel_register();
 		}
 	}
 	/* UnregisterModule */
 	else if (func == 0x01) {
 		WORD handle = CPU_AX - 1;
-		CPU_EIP += 4;
-		if ((handle > 5) || !vdd_modules[handle].hvdd) {
+		if ((handle >= 5) || !vdd_modules[handle].hvdd) {
 			return; // ntvdm exits here
 		}
 		for (int i = 0; i < 5; i++) {
@@ -26778,11 +26968,22 @@ void vdd_req(char func)
 	/* DispatchCall */
 	else if (func == 0x02) {
 		WORD handle = CPU_AX - 1;
-		CPU_EIP += 4;
-		if ((handle > 5) || !vdd_modules[handle].hvdd) {
+		if ((handle >= 5) || !vdd_modules[handle].hvdd) {
 			return; // ntvdm exits here
 		}
+		pIntelRegister = (X86_CONTEXT*)(((ULONG_PTR)bytIntelRegister + 15) & ~15);
+		vdd_store_intel_register();
+#if defined(_MSC_VER) || (defined(__clang__) && (__clang_major__ > 3 || (__clang_major__ == 3 && __clang_minor__ >= 7)))
+		__try {
+			vdd_modules[handle].dispatch();
+		} __except(EXCEPTION_EXECUTE_HANDLER) {
+			pIntelRegister->EFlags |= 0x1; // CF = 1
+			pIntelRegister->Eax |= 0xffff; // AX = FFFFh
+		}
+#else
 		vdd_modules[handle].dispatch();
+#endif
+		vdd_restore_intel_register();
 	}
 }
 
@@ -26908,122 +27109,170 @@ DWORD getEDI()
 
 void setAL(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_AL = val;
+	vdd_store_intel_register();
 }
 
 void setAH(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_AH = val;
+	vdd_store_intel_register();
 }
 
 void setAX(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_AX = val;
+	vdd_store_intel_register();
 }
 
 void setEAX(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EAX = val;
+	vdd_store_intel_register();
 }
 
 void setBL(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_BL = val;
+	vdd_store_intel_register();
 }
 
 void setBH(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_BH = val;
+	vdd_store_intel_register();
 }
 
 void setBX(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_BX = val;
+	vdd_store_intel_register();
 }
 
 void setEBX(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EBX = val;
+	vdd_store_intel_register();
 }
 
 void setCL(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_CL = val;
+	vdd_store_intel_register();
 }
 
 void setCH(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_CH = val;
+	vdd_store_intel_register();
 }
 
 void setCX(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_CX = val;
+	vdd_store_intel_register();
 }
 
 void setECX(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_ECX = val;
+	vdd_store_intel_register();
 }
 
 void setDL(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_DL = val;
+	vdd_store_intel_register();
 }
 
 void setDH(BYTE val)
 {
+	vdd_restore_intel_register();
 	CPU_DH = val;
+	vdd_store_intel_register();
 }
 
 void setDX(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_DX = val;
+	vdd_store_intel_register();
 }
 
 void setEDX(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EDX = val;
+	vdd_store_intel_register();
 }
 
 void setSP(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SP = val;
+	vdd_store_intel_register();
 }
 
 void setESP(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_ESP = val;
+	vdd_store_intel_register();
 }
 
 void setBP(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_BP = val;
+	vdd_store_intel_register();
 }
 
 void setEBP(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EBP = val;
+	vdd_store_intel_register();
 }
 
 void setSI(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SI = val;
+	vdd_store_intel_register();
 }
 
 void setESI(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_ESI = val;
+	vdd_store_intel_register();
 }
 
 void setDI(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_DI = val;
+	vdd_store_intel_register();
 }
 
 void setEDI(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EDI = val;
+	vdd_store_intel_register();
 }
 
 WORD getDS()
@@ -27058,32 +27307,44 @@ WORD getGS()
 
 void setDS(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_DS = val;
+	vdd_store_intel_register();
 }
 
 void setES(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_ES = val;
+	vdd_store_intel_register();
 }
 
 void setCS(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_CS = val;
+	vdd_store_intel_register();
 }
 
 void setSS(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SS = val;
+	vdd_store_intel_register();
 }
 
 void setFS(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_FS = val;
+	vdd_store_intel_register();
 }
 
 void setGS(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_GS = val;
+	vdd_store_intel_register();
 }
 
 WORD getIP()
@@ -27098,12 +27359,16 @@ DWORD getEIP()
 
 void setIP(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EIP = (CPU_EIP & ~0xffff) | val;
+	vdd_store_intel_register();
 }
 
 void setEIP(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_EIP = val;
+	vdd_store_intel_register();
 }
 
 DWORD getCF()
@@ -27148,42 +27413,58 @@ DWORD getOF()
 
 void setCF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_C_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setPF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_P_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setAF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_A_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setZF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_Z_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setSF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_S_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setIF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_I_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setDF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_D_FLAG(val);
+	vdd_store_intel_register();
 }
 
 void setOF(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_O_FLAG(val);
+	vdd_store_intel_register();
 }
 
 DWORD getEFLAGS()
@@ -27193,7 +27474,9 @@ DWORD getEFLAGS()
 
 void setEFLAGS(DWORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_EFLAG(val);
+	vdd_store_intel_register();
 }
 
 WORD getMSW()
@@ -27203,62 +27486,110 @@ WORD getMSW()
 
 void setMSW(WORD val)
 {
+	vdd_restore_intel_register();
 	CPU_SET_CR0((CPU_CR0 & ~0xffff) | val);
+	vdd_store_intel_register();
+}
+
+void vdd_store_intel_register()
+{
+	memset(pIntelRegister, 0, sizeof(X86_CONTEXT));
+	
+	pIntelRegister->ContextFlags  = 0x00010000; // Intel 386
+	pIntelRegister->ContextFlags |= 0x00000010; // DR0, DR1, DR2, DR3, DR6, DR7
+	pIntelRegister->ContextFlags |= 0x00000004; // DS, ES, FS, GS
+	pIntelRegister->ContextFlags |= 0x00000002; // AX, BX, CX, DX, SI, DI
+	pIntelRegister->ContextFlags |= 0x00000001; // SS:SP, CS:IP, FLAGS, BP
+	
+	pIntelRegister->Dr0    = CPU_DR(0);
+	pIntelRegister->Dr1    = CPU_DR(1);
+	pIntelRegister->Dr2    = CPU_DR(2);
+	pIntelRegister->Dr3    = CPU_DR(3);
+	pIntelRegister->Dr6    = CPU_DR(6);
+	pIntelRegister->Dr7    = CPU_DR(7);
+	pIntelRegister->SegGs  = CPU_GS;
+	pIntelRegister->SegFs  = CPU_FS;
+	pIntelRegister->SegEs  = CPU_ES;
+	pIntelRegister->SegDs  = CPU_DS;
+	pIntelRegister->Edi    = CPU_EDI;
+	pIntelRegister->Esi    = CPU_ESI;
+	pIntelRegister->Ebx    = CPU_EBX;
+	pIntelRegister->Edx    = CPU_EDX;
+	pIntelRegister->Ecx    = CPU_ECX;
+	pIntelRegister->Eax    = CPU_EAX;
+	pIntelRegister->Ebp    = CPU_EBP;
+	pIntelRegister->Eip    = CPU_EIP;
+	pIntelRegister->SegCs  = CPU_CS;
+	pIntelRegister->EFlags = CPU_EFLAG;
+	pIntelRegister->Esp    = CPU_ESP;
+	pIntelRegister->SegSs  = CPU_SS;
+	
+#if defined(SUPPORT_FPU)
+	pIntelRegister->ContextFlags |= 0x00000008; // FPU
+	
+	pIntelRegister->FloatSave.ControlWord   = FPU_CTRLWORD;
+	pIntelRegister->FloatSave.StatusWord    = FPU_STATUSWORD;
+	pIntelRegister->FloatSave.TagWord       = FPU_TAGWORD;
+	pIntelRegister->FloatSave.ErrorOffset   = FPU_INSTPTR_OFFSET;
+	pIntelRegister->FloatSave.ErrorSelector = FPU_INSTPTR_SEG;
+	pIntelRegister->FloatSave.DataOffset    = FPU_DATAPTR_OFFSET;
+	pIntelRegister->FloatSave.DataSelector  = FPU_DATAPTR_SEG;
+	for (int n = 0; n < 8; n++) {
+		for (int i = 0; i < 10; i++) {
+			pIntelRegister->FloatSave.RegisterArea[n * 10 + i] = FPU_REG(n, i);
+		}
+	}
+	pIntelRegister->FloatSave.Cr0NpxState   = (CPU_CR0 & 0xffff) | (FPU_STATUSWORD << 16);
+#endif
+}
+
+void vdd_restore_intel_register()
+{
+	CPU_DR(0) = pIntelRegister->Dr0;
+	CPU_DR(1) = pIntelRegister->Dr1;
+	CPU_DR(2) = pIntelRegister->Dr2;
+	CPU_DR(3) = pIntelRegister->Dr3;
+	CPU_DR(6) = pIntelRegister->Dr6;
+	CPU_DR(7) = pIntelRegister->Dr7;
+	CPU_GS    = pIntelRegister->SegGs;
+	CPU_FS    = pIntelRegister->SegFs;
+	CPU_ES    = pIntelRegister->SegEs;
+	CPU_DS    = pIntelRegister->SegDs;
+	CPU_EDI   = pIntelRegister->Edi;
+	CPU_ESI   = pIntelRegister->Esi;
+	CPU_EBX   = pIntelRegister->Ebx;
+	CPU_EDX   = pIntelRegister->Edx;
+	CPU_ECX   = pIntelRegister->Ecx;
+	CPU_EAX   = pIntelRegister->Eax;
+	CPU_EBP   = pIntelRegister->Ebp;
+	CPU_EIP   = pIntelRegister->Eip;
+	CPU_CS    = pIntelRegister->SegCs;
+//	CPU_EFLAG = pIntelRegister->EFlags;
+	CPU_SET_EFLAG(pIntelRegister->EFlags);
+	CPU_ESP   = pIntelRegister->Esp;
+	CPU_SS    = pIntelRegister->SegSs;
+	
+#if defined(SUPPORT_FPU)
+	FPU_CTRLWORD       = pIntelRegister->FloatSave.ControlWord;
+	FPU_STATUSWORD     = pIntelRegister->FloatSave.StatusWord;
+	FPU_TAGWORD        = pIntelRegister->FloatSave.TagWord;
+	FPU_INSTPTR_OFFSET = pIntelRegister->FloatSave.ErrorOffset;
+	FPU_INSTPTR_SEG    = pIntelRegister->FloatSave.ErrorSelector;
+	FPU_DATAPTR_OFFSET = pIntelRegister->FloatSave.DataOffset;
+	FPU_DATAPTR_SEG    = pIntelRegister->FloatSave.DataSelector;
+	for (int n = 0; n < 8; n++) {
+		for (int i = 0; i < 10; i++) {
+//			FPU_REG(n, i) = pIntelRegister->FloatSave.RegisterArea[n * 10 + i];
+			SET_FPU_REG(n, i, pIntelRegister->FloatSave.RegisterArea[n * 10 + i]);
+		}
+	}
+	CPU_CR0 = (CPU_CR0 & ~0xffff) | (pIntelRegister->FloatSave.Cr0NpxState & 0xffff);
+#endif
 }
 
 PVOID getIntelRegistersPointer()
 {
-	static X86_CONTEXT IntelRegister;
-	
-	memset(&IntelRegister, 0, sizeof(IntelRegister));
-	
-	IntelRegister.ContextFlags  = 0x00010000; // Intel 386
-	IntelRegister.ContextFlags |= 0x00000010; // DR0, DR1, DR2, DR3, DR6, DR7
-	IntelRegister.ContextFlags |= 0x00000004; // DS, ES, FS, GS
-	IntelRegister.ContextFlags |= 0x00000002; // AX, BX, CX, DX, SI, DI
-	IntelRegister.ContextFlags |= 0x00000001; // SS:SP, CS:IP, FLAGS, BP
-	
-	IntelRegister.Dr0    = CPU_DR(0);
-	IntelRegister.Dr1    = CPU_DR(1);
-	IntelRegister.Dr2    = CPU_DR(2);
-	IntelRegister.Dr3    = CPU_DR(3);
-	IntelRegister.Dr6    = CPU_DR(6);
-	IntelRegister.Dr7    = CPU_DR(7);
-	IntelRegister.SegGs  = CPU_GS;
-	IntelRegister.SegFs  = CPU_FS;
-	IntelRegister.SegEs  = CPU_ES;
-	IntelRegister.SegDs  = CPU_DS;
-	IntelRegister.Edi    = CPU_EDI;
-	IntelRegister.Esi    = CPU_ESI;
-	IntelRegister.Ebx    = CPU_EBX;
-	IntelRegister.Edx    = CPU_EDX;
-	IntelRegister.Ecx    = CPU_ECX;
-	IntelRegister.Eax    = CPU_EAX;
-	IntelRegister.Ebp    = CPU_EBP;
-	IntelRegister.Eip    = CPU_EIP;
-	IntelRegister.SegCs  = CPU_CS;
-	IntelRegister.EFlags = CPU_EFLAG;
-	IntelRegister.Esp    = CPU_ESP;
-	IntelRegister.SegSs  = CPU_SS;
-	
-#if defined(SUPPORT_FPU)
-	IntelRegister.ContextFlags |= 0x00000008; // FPU
-	
-	IntelRegister.FloatSave.ControlWord   = FPU_CTRLWORD;
-	IntelRegister.FloatSave.StatusWord    = FPU_STATUSWORD;
-	IntelRegister.FloatSave.TagWord       = FPU_TAGWORD;
-	IntelRegister.FloatSave.ErrorOffset   = FPU_INSTPTR_OFFSET;
-	IntelRegister.FloatSave.ErrorSelector = FPU_INSTPTR_SEG;
-	IntelRegister.FloatSave.DataOffset    = FPU_DATAPTR_OFFSET;
-	IntelRegister.FloatSave.DataSelector  = FPU_DATAPTR_SEG;
-	for (int n = 0; n < 8; n++) {
-		for (int i = 0; i < 10; i++) {
-			IntelRegister.FloatSave.RegisterArea[n * 10 + i] = FPU_REG(n, i);
-		}
-	}
-	IntelRegister.FloatSave.Cr0NpxState   = 0; // ???
-#endif
-	return &IntelRegister;
+	return pIntelRegister;
 }
 
 PBYTE MGetVdmPointer(DWORD addr, DWORD size, BOOL protmode)
@@ -27657,9 +27988,11 @@ BOOL VDDSetDMA(HANDLE hvdd, WORD ch, WORD flag, PVDD_DMA_INFO info)
 
 void VDDSimulate16()
 {
+	vdd_restore_intel_register();
 	while (!(msdos_stat & (REQ_EXIT | REQ_UNSIM16))) {
 		hardware_run_cpu();
 	}
+	vdd_store_intel_register();
 	msdos_stat &= ~REQ_UNSIM16;
 }
 
@@ -27827,6 +28160,77 @@ HANDLE VDDRetrieveNtHandle(ULONG pPDB, SHORT hFile, PVOID* ppSFT, PVOID* ppJFT)
 	return INVALID_HANDLE_VALUE;
 }
 
+// I confirmed the behavior of VdmParametersInfo() and VdmGetParametersInfoError() on Windows 2000
+
+BOOL VdmParametersInfo(VDM_INFO_TYPE infotype, PVOID pBuffer, ULONG cbBufferSize)
+{
+	// It seems return-value of VdmGetParametersInfoError() never be reset even if VdmParametersInfo() succeeds
+//	VdmParametersInfoError = VDM_NO_ERROR;
+	
+	switch(infotype) {
+	case VDM_GET_TICK_COUNT:
+		if(cbBufferSize == 8) {
+			// It seems to return sec and usec as DWORD values
+			// NOTE: usec value is always (n * 1000), so it is better to use QueryPerformanceCounter()
+			DWORD time = timeGetTime();
+			((DWORD *)pBuffer)[0] = (time / 1000);
+			((DWORD *)pBuffer)[1] = (time % 1000) * 1000;
+			return TRUE;
+		} else {
+			VdmParametersInfoError = VDM_ERROR_INVALID_BUFFER_SIZE;
+		}
+		break;
+	case VDM_GET_TIMER0_INITIAL_COUNT:
+		if(cbBufferSize == 4) {
+			*(DWORD *)pBuffer = PIT_COUNT_VALUE(0);
+			return TRUE;
+		} else {
+			VdmParametersInfoError = VDM_ERROR_INVALID_BUFFER_SIZE;
+		}
+		break;
+	case VDM_GET_LAST_UPDATED_TIMER0_COUNT:
+		if(cbBufferSize == 2) {
+			if(!pit[0].count_latched) {
+				pit_latch_count(0);
+			}
+			*(WORD *)pBuffer = pit[0].latch;
+			return TRUE;
+		} else {
+			VdmParametersInfoError = VDM_ERROR_INVALID_BUFFER_SIZE;
+		}
+		break;
+	case VDM_LATCH_TIMER0_COUNT:
+		if(cbBufferSize == 2) {
+			pit_latch_count(0);
+			*(WORD *)pBuffer = pit[0].latch;
+			return TRUE;
+		} else {
+			VdmParametersInfoError = VDM_ERROR_INVALID_BUFFER_SIZE;
+		}
+		break;
+	case VDM_SET_NEXT_TIMER0_COUNT:
+		if(cbBufferSize == 2) {
+			// When succeeded, I found pBuffer value is CCCCh uing debug build of vdd dll
+			// It seems this command does nothing and pBuffer is not updated
+			return TRUE;
+		} else {
+			VdmParametersInfoError = VDM_ERROR_INVALID_BUFFER_SIZE;
+		}
+		break;
+	default:
+		VdmParametersInfoError = VDM_ERROR_INVALID_FUNCTION;
+		break;
+	}
+	return FALSE;
+}
+
+// NOTE: nt_vdd.h says return-value type is VDM_INFO_TYPE, but I believe this is simply the typo
+
+VDM_ERROR_TYPE VdmGetParametersInfoError(VOID)
+{
+	return VdmParametersInfoError;
+}
+
 BOOL vdd_io_read(int port, int size, void *val)
 {
 	for (int i = 0; i < 5; i++) {
@@ -27990,6 +28394,8 @@ void vdd_init_table(PVDD_FUNC_TABLE ptr)
 	ptr->VDDReleaseDosHandle = VDDReleaseDosHandle;
 	ptr->VDDAssociateNtHandle = VDDAssociateNtHandle;
 	ptr->VDDRetrieveNtHandle = VDDRetrieveNtHandle;
+	ptr->VdmParametersInfo = VdmParametersInfo;
+	ptr->VdmGetParametersInfoError = VdmGetParametersInfoError;
 }
 #endif
 
@@ -28251,10 +28657,10 @@ static VOID DosCallDriver(PAIR32 Driver, DOS_REQUEST_HEADER *Request)
 	// Call the strategy routine, and then the interrupt routine
 	RunCallback16(Driver.w.h, DriverBlock->strategy);
 	RunCallback16(Driver.w.h, DriverBlock->interrupt);
- 
+
 	// Get the request structure from ES:BX
 	memmove(Request, &sda->Request, Request->RequestLength);
- 
+
 	// Restore the registers
 	CPU_AX = tmp_AX;
 	CPU_CX = tmp_CX;
